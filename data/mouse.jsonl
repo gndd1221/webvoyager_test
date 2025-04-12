@@ -1,0 +1,1 @@
+{"web_name": "amazon Shopping", "id": "amazon--03", "ques": "Go to amazon (https://www.amazon.com/), search for 'gaming mouse', find the top 1 'gaming mouse' with most 'Avg. Customer Review', and return its name and price.", "web": "https://www.amazon.com/"}

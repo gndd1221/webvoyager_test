@@ -1,0 +1,1 @@
+{"web_name": "amazon Shopping", "id": "amazon--01", "ques": "Go to amazon (https://www.amazon.com/), search for 'laptop' ,find the sort by best seller top 1 laptop , and return their names and prices.", "web": "https://www.amazon.com/"}
