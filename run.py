@@ -219,7 +219,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_file', type=str, default='data/mouse.jsonl')
     parser.add_argument('--max_iter', type=int, default=15)
-    parser.add_argument("--api_key", default="AIzaSyAxHuw0bbCLmTi8iCDoBIv1XPranhGjXDA", type=str, help="YOUR_GEMINI_API_KEY")
+    parser.add_argument("--api_key", default="your api", type=str, help="YOUR_GEMINI_API_KEY")
     parser.add_argument("--api_model", default="gemini-2.0-flash", type=str, help="Gemini API model name")
     parser.add_argument("--output_dir", type=str, default='results')
     parser.add_argument("--seed", type=int, default=None)
