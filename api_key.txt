@@ -1,0 +1,1 @@
+python run.py --test_file data/mouse.jsonl --api_key AIzaSyAxHuw0bbCLmTi8iCDoBIv1XPranhGjXDA

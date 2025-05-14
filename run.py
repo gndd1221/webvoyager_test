@@ -6,6 +6,8 @@ import re
 import os
 import shutil
 import logging
+from typing import List, Dict, Optional, Any, Literal
+from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -14,11 +16,11 @@ from selenium.webdriver.common.action_chains import ActionChains
 
 from prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_ONLY, SYSTEM_PREVIOUS_STEP, ERROR_GROUNDING_AGENT_PROMPT
 import google.generativeai as genai
-from utils import get_web_element_rect, encode_image, extract_information, print_message, \
-    get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs, clip_message_and_obs_text_only
+from utils import get_web_element_rect, encode_image, extract_information, print_message, get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs, clip_message_and_obs_text_only
+from pdf_rag import PDFEnhancementPipeline
+from instruction_manual_generator import InstructionManualGenerator
 
 def setup_logger(folder_path):
-    """設置日誌記錄，將日誌保存到指定文件"""
     log_file_path = os.path.join(folder_path, 'agent.log')
     logger = logging.getLogger()
     for handler in logger.handlers[:]:
@@ -29,81 +31,39 @@ def setup_logger(folder_path):
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+    return logger
 
 def driver_config(args):
-    """配置 Selenium WebDriver 的 Chrome 選項"""
     options = webdriver.ChromeOptions()
     options.add_argument("disable-blink-features=AutomationControlled")
-
     if args.save_accessibility_tree:
         args.force_device_scale = True
-
     if args.force_device_scale:
         options.add_argument("--force-device-scale-factor=1")
     if args.headless:
         options.add_argument("--headless")
-        options.add_argument(
-            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-        )
-    options.add_experimental_option(
-        "prefs", {
-            "download.default_directory": args.download_dir,
-            "plugins.always_open_pdf_externally": True
-        }
-    )
+        options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+    options.add_experimental_option("prefs", {"download.default_directory": args.download_dir, "plugins.always_open_pdf_externally": True})
     return options
 
 def format_msg(it, init_msg, pdf_obs, warn_obs, web_img_b64, web_text, prev_step_action=""):
-    """格式化帶圖片的訊息"""
     if it == 1:
         init_msg += f"{prev_step_action}\nI've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"
-        init_msg_format = {
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': init_msg},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{web_img_b64}"}}
-            ]
-        }
-        return init_msg_format
+        return {'role': 'user', 'content': [{'type': 'text', 'text': init_msg}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{web_img_b64}"}}]}
     else:
         if not pdf_obs:
-            curr_msg = {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': f"{prev_step_action}\nObservation:{warn_obs} please analyze the attached screenshot and give the Thought and Action. I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{web_img_b64}"}}
-                ]
-            }
+            return {'role': 'user', 'content': [{'type': 'text', 'text': f"{prev_step_action}\nObservation:{warn_obs} please analyze the attached screenshot and give the Thought and Action. I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{web_img_b64}"}}]}
         else:
-            curr_msg = {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': f"{prev_step_action}\nObservation: {pdf_obs} Please analyze the response given by Assistant, then consider whether to continue iterating or not. The screenshot of the current page is also attached, give the Thought and Action. I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{web_img_b64}"}}
-                ]
-            }
-        return curr_msg
+            return {'role': 'user', 'content': [{'type': 'text', 'text': f"{prev_step_action}\nObservation: {pdf_obs} Please analyze the response given by Assistant, then consider whether to continue iterating or not. The screenshot of the current page is also attached, give the Thought and Action. I've provided the tag name of each element and the text it contains (if text exists). Note that <textarea> or <input> may be textbox, but not exactly. Please focus more on the screenshot and then refer to the textual information.\n{web_text}"}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{web_img_b64}"}}]}
 
 def format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree, prev_step_action=""):
-    """格式化純文字訊息"""
     if it == 1:
-        init_msg_format = {
-            'role': 'user',
-            'content': init_msg + '\n' + ac_tree
-        }
-        return init_msg_format
+        return {'role': 'user', 'content': init_msg + '\n' + ac_tree}
     else:
         if not pdf_obs:
-            curr_msg = {
-                'role': 'user',
-                'content': f"{prev_step_action}\nObservation:{warn_obs} please analyze the accessibility tree and give the Thought and Action.\n{ac_tree}"
-            }
+            return {'role': 'user', 'content': f"{prev_step_action}\nObservation:{warn_obs} please analyze the accessibility tree and give the Thought and Action.\n{ac_tree}"}
         else:
-            curr_msg = {
-                'role': 'user',
-                'content': f"{prev_step_action}\nObservation: {pdf_obs} Please analyze the response given by Assistant, then consider whether to continue iterating or not. The accessibility tree of the current page is also given, give the Thought and Action.\n{ac_tree}"
-            }
-        return curr_msg
+            return {'role': 'user', 'content': f"{prev_step_action}\nObservation: {pdf_obs} Please analyze the response given by Assistant, then consider whether to continue iterating or not. The accessibility tree of the current page is also given, give the Thought and Action.\n{ac_tree}"}
 
 def call_gemini_api(args, messages):
     retry_times = 0
@@ -113,13 +73,9 @@ def call_gemini_api(args, messages):
             model = genai.GenerativeModel(args.api_model)
             parts = convert_messages_to_parts(messages)
             response = model.generate_content(parts, generation_config={"temperature": args.temperature})
-            prompt_tokens = 0
-            completion_tokens = 0
-            gemini_call_error = False
-            return prompt_tokens, completion_tokens, gemini_call_error, response
+            return 0, 0, False, response  # Token counts not available in Gemini API
         except Exception as e:
             logging.info(f'Error occurred: {str(e)}')
-            logging.info(f'Retrying. Error type: {type(e).__name__}')
             time.sleep(5)
             retry_times += 1
             if retry_times >= 10:
@@ -127,7 +83,6 @@ def call_gemini_api(args, messages):
                 return None, None, True, None
 
 def convert_messages_to_parts(messages):
-    """將訊息轉換為 Gemini API 可接受的格式"""
     parts = []
     for msg in messages:
         if msg['role'] == 'system':
@@ -146,13 +101,11 @@ def convert_messages_to_parts(messages):
     return parts
 
 def exec_action_click(info, web_ele, driver_task):
-    """執行點擊操作"""
     driver_task.execute_script("arguments[0].setAttribute('target', '_self')", web_ele)
     web_ele.click()
     time.sleep(3)
 
 def exec_action_type(info, web_ele, driver_task):
-    """執行輸入操作"""
     warn_obs = ""
     type_content = info['content']
     ele_tag_name = web_ele.tag_name.lower()
@@ -169,14 +122,11 @@ def exec_action_type(info, web_ele, driver_task):
         web_ele.send_keys(Keys.BACKSPACE)
     except:
         pass
-
     actions = ActionChains(driver_task)
     actions.click(web_ele).perform()
     actions.pause(1)
     try:
-        driver_task.execute_script(
-            """window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea' && e.target.type != 'search') {e.preventDefault();}};"""
-        )
+        driver_task.execute_script("window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea' && e.target.type != 'search') {e.preventDefault();}};")
     except:
         pass
     actions.send_keys(type_content)
@@ -187,7 +137,6 @@ def exec_action_type(info, web_ele, driver_task):
     return warn_obs
 
 def exec_action_scroll(info, web_eles, driver_task, args, obs_info):
-    """執行滾動操作"""
     scroll_ele_number = info['number']
     scroll_content = info['content']
     if scroll_ele_number == "WINDOW":
@@ -202,10 +151,7 @@ def exec_action_scroll(info, web_eles, driver_task, args, obs_info):
         else:
             element_box = obs_info[scroll_ele_number]['union_bound']
             element_box_center = (element_box[0] + element_box[2] // 2, element_box[1] + element_box[3] // 2)
-            web_ele = driver_task.execute_script(
-                "return document.elementFromPoint(arguments[0], arguments[1]);",
-                element_box_center[0], element_box_center[1]
-            )
+            web_ele = driver_task.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
         actions = ActionChains(driver_task)
         driver_task.execute_script("arguments[0].focus();", web_ele)
         if scroll_content == 'down':
@@ -214,12 +160,39 @@ def exec_action_scroll(info, web_eles, driver_task, args, obs_info):
             actions.key_down(Keys.ALT).send_keys(Keys.ARROW_UP).key_up(Keys.ALT).perform()
     time.sleep(3)
 
+def index_pdf(pdf_path: str, output_dir: str, api_key: str, logger: logging.Logger, persist_directory: str = "./chroma_db") -> Dict[str, Any]:
+    pipeline = PDFEnhancementPipeline(gemini_api_key=api_key, logger=logger, embedding_type="bge-m3", persist_directory=persist_directory)
+    logger.info(f"Starting to process {pdf_path}...")
+    result = pipeline.process_pdf(pdf_path=pdf_path, output_dir=output_dir, add_image_descriptions=True, index_for_rag=True, overwrite_enhanced_md=False)
+    logger.info("Processing completed:")
+    logger.info(f"- Original PDF: {result['original_pdf']}")
+    logger.info(f"- Markdown file: {result['markdown_path']}")
+    logger.info(f"- Number of processed images: {result['image_count']}")
+    if 'enhanced_markdown_path' in result:
+        logger.info(f"- Enhanced Markdown: {result['enhanced_markdown_path']}")
+    return result
+
+def search_rag(query: str, api_key: str, logger: logging.Logger, persist_directory: str = "./chroma_db", k: int = 20) -> List[Dict]:
+    pipeline = PDFEnhancementPipeline(gemini_api_key=api_key, logger=logger, embedding_type="bge-m3", persist_directory=persist_directory)
+    logger.info(f"Searching for: {query}")
+    results = pipeline.search(query=query, k=k)
+    filtered_results = [{k: d[k] for k in ["section", "content", "source"] if k in d} for d in results]
+    results_str = ""
+    for entry in filtered_results:
+        results_str += f"section: {entry['section']}\ncontent: {entry['content']}\nsource: {entry['source']}\n\n"
+    logger.info(f"Searching results:\n {results_str}")
+    return filtered_results
+
+def generate_instruction_manual(api_key: str, task_goal: str, filtered_results: List[Dict], logger: logging.Logger, instruction_format: Literal["text_steps", "json_blocks"]) -> str:
+    manual_generator = InstructionManualGenerator(gemini_api_key=api_key, task_goal=task_goal, results=filtered_results, logger=logger, instruction_format=instruction_format)
+    return manual_generator.generate_instruction_manual()
+
+
 def main():
-    """主函數"""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--test_file', type=str, default='data/mouse.jsonl')
+    parser.add_argument('--test_file', type=str, default='data/test.jsonl')
     parser.add_argument('--max_iter', type=int, default=15)
-    parser.add_argument("--api_key", default="your api", type=str, help="YOUR_GEMINI_API_KEY")
+    parser.add_argument("--api_key", default="YOUR_GEMINI_API_KEY", type=str, help="YOUR_GEMINI_API_KEY")
     parser.add_argument("--api_model", default="gemini-2.0-flash", type=str, help="Gemini API model name")
     parser.add_argument("--output_dir", type=str, default='results')
     parser.add_argument("--seed", type=int, default=None)
@@ -227,21 +200,19 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--download_dir", type=str, default="downloads")
     parser.add_argument("--text_only", action='store_true')
-    parser.add_argument("--headless", action='store_true', help='The window of selenium')
+    parser.add_argument("--headless", action='store_true')
     parser.add_argument("--save_accessibility_tree", action='store_true')
     parser.add_argument("--force_device_scale", action='store_true')
     parser.add_argument("--window_width", type=int, default=1024)
     parser.add_argument("--window_height", type=int, default=768)
     parser.add_argument("--fix_box_color", action='store_true')
-    parser.add_argument("--start_maximized", action='store_true')  # 新增：最大化視窗
-    parser.add_argument("--trajectory", action='store_true')  # 新增：啟用操作歷史
-    parser.add_argument("--error_max_reflection_iter", type=int, default=5, help='Number of reflection restarts allowed when exceeding max_iter')  # 新增：反思次數
+    parser.add_argument("--start_maximized", action='store_true')
+    parser.add_argument("--trajectory", action='store_true')
+    parser.add_argument("--error_max_reflection_iter", type=int, default=5)
+    parser.add_argument("--pdf_path", type=str, default='data/amazon_search.pdf')
 
     args = parser.parse_args()
-
-    # 設定 Gemini API 金鑰
     genai.configure(api_key=args.api_key)
-
     options = driver_config(args)
 
     current_time = time.strftime("%Y%m%d_%H_%M_%S", time.localtime())
@@ -253,11 +224,17 @@ def main():
         for line in f:
             tasks.append(json.loads(line))
 
+    init_dir = os.path.join(result_dir, 'init')
+    os.makedirs(init_dir, exist_ok=True)
+    init_logger = setup_logger(init_dir)
+    markdown_output_dir = "output"
+    index_pdf(pdf_path=args.pdf_path, output_dir=markdown_output_dir, api_key=args.api_key, logger=init_logger)
+
     for task_id in range(len(tasks)):
         task = tasks[task_id]
         task_dir = os.path.join(result_dir, 'task{}'.format(task["id"]))
         os.makedirs(task_dir, exist_ok=True)
-        setup_logger(task_dir)
+        task_logger = setup_logger(task_dir)
         logging.info(f'########## TASK{task["id"]} ##########')
 
         driver_task = webdriver.Chrome(options=options)
@@ -270,12 +247,9 @@ def main():
             driver_task.find_element(By.TAG_NAME, 'body').click()
         except:
             pass
-        driver_task.execute_script(
-            """window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea') {e.preventDefault();}};"""
-        )
+        driver_task.execute_script("window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea') {e.preventDefault();}};")
         time.sleep(10)
 
-        # 清空下載目錄
         for filename in os.listdir(args.download_dir):
             file_path = os.path.join(args.download_dir, filename)
             if os.path.isfile(file_path):
@@ -293,20 +267,32 @@ def main():
             messages = [{'role': 'system', 'content': SYSTEM_PROMPT_TEXT_ONLY}]
             obs_prompt = "Observation: please analyze the accessibility tree and give the Thought and Action."
 
-        init_msg = f"Now given a task: {task['ques']}  Please interact with {task['web']} and get the answer. \n"
-        init_msg = init_msg + obs_prompt
+        rag_results = search_rag(query=task['ques'], api_key=args.api_key, logger=task_logger)
+        manual = generate_instruction_manual(api_key=args.api_key, task_goal=task['ques'], filtered_results=rag_results, logger=task_logger, instruction_format="text_steps")
+        logging.info(f"manual:\n {manual}")
+
+        today_date = datetime.today().strftime('%Y-%m-%d')
+        init_msg = f"""Today is {today_date}. Now given a task: {task['ques']} Please interact with {task['web']} and get the answer.\n"""
+        init_msg += """Before taking action, carefully analyze the contents in [Manuals and QA pairs] below.
+Determine whether [Manuals and QA pairs] contain relevant procedures, constraints, or guidelines that should be followed for this task.
+If so, follow their guidance accordingly. If not, proceed with a logical and complete approach.\n"""
+        init_msg += f"""[Key Guidelines You MUST follow]
+Before taking any action, analyze the provided [Manuals and QA pairs] as a whole to determine if they contain useful procedures, constraints, or guidelines relevant to this task.
+ - If [Manuals and QA pairs] provide comprehensive guidance, strictly follow their instructions in an ordered and structured manner.
+ - If [Manuals and QA pairs] contain partial but useful information, integrate it into your approach while filling in the gaps logically.
+ - If [Manuals and QA pairs] are entirely irrelevant or insufficient, proceed with the best available method while ensuring completeness.\n
+[Manuals and QA pairs]
+{manual}\n"""
+        init_msg += obs_prompt
 
         it = 0
         accumulate_prompt_token = 0
         accumulate_completion_token = 0
 
-        # Error Grounding Agent 相關變數
         activate_EGA = True
         error_exist = False
         EGA_explanation = ""
         bot_thought = ""
-
-        # 操作歷史
         current_history = ""
 
         while it < args.max_iter:
@@ -320,10 +306,7 @@ def main():
                         accessibility_tree_path = os.path.join(task_dir, f'accessibility_tree{it}')
                         ac_tree, obs_info = get_webarena_accessibility_tree(driver_task, accessibility_tree_path)
                 except Exception as e:
-                    if not args.text_only:
-                        logging.error('Driver error when adding set-of-mark.')
-                    else:
-                        logging.error('Driver error when obtaining accessibility tree.')
+                    logging.error('Driver error when adding set-of-mark.' if not args.text_only else 'Driver error when obtaining accessibility tree.')
                     logging.error(e)
                     break
 
@@ -336,16 +319,9 @@ def main():
 
                 b64_img = encode_image(img_path)
 
-                # Error Grounding Agent
                 if it > 1 and activate_EGA:
                     EGA_messages = [{'role': 'system', 'content': ERROR_GROUNDING_AGENT_PROMPT}]
-                    EGA_user_messages = {
-                        'role': 'user',
-                        'content': [
-                            {'type': 'text', 'text': 'Thought:' + bot_thought + '\nScreenshot:'},
-                            {'type': 'image_url', 'image_url': {"url": f"data:image/png;base64,{b64_img}"}}
-                        ]
-                    }
+                    EGA_user_messages = {'role': 'user', 'content': [{'type': 'text', 'text': 'Thought:' + bot_thought + '\nScreenshot:'}, {'type': 'image_url', 'image_url': {"url": f"data:image/png;base64,{b64_img}"}}]}
                     EGA_messages.append(EGA_user_messages)
                     _, _, gemini_call_error, EGA_response = call_gemini_api(args, EGA_messages)
                     if gemini_call_error:
@@ -403,7 +379,6 @@ def main():
             chosen_action = re.split(pattern, gemini_response_text)[2].strip()
             action_key, info = extract_information(chosen_action)
 
-            # 操作歷史記錄
             trajectory_info = f"Thought: {bot_thought}\nAction: {chosen_action}"
             error_info = f"Error: {error_exist}\nExplanation: {EGA_explanation}"
             if args.trajectory:
@@ -425,12 +400,8 @@ def main():
                     else:
                         click_ele_number = info[0]
                         element_box = obs_info[click_ele_number]['union_bound']
-                        element_box_center = (element_box[0] + element_box[2] // 2,
-                                              element_box[1] + element_box[3] // 2)
-                        web_ele = driver_task.execute_script(
-                            "return document.elementFromPoint(arguments[0], arguments[1]);",
-                            element_box_center[0], element_box_center[1]
-                        )
+                        element_box_center = (element_box[0] + element_box[2] // 2, element_box[1] + element_box[3] // 2)
+                        web_ele = driver_task.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
                     exec_action_click(info, web_ele, driver_task)
                     current_files = sorted(os.listdir(args.download_dir))
                     if current_files != download_files:
@@ -456,12 +427,8 @@ def main():
                     else:
                         type_ele_number = info['number']
                         element_box = obs_info[type_ele_number]['union_bound']
-                        element_box_center = (element_box[0] + element_box[2] // 2,
-                                              element_box[1] + element_box[3] // 2)
-                        web_ele = driver_task.execute_script(
-                            "return document.elementFromPoint(arguments[0], arguments[1]);",
-                            element_box_center[0], element_box_center[1]
-                        )
+                        element_box_center = (element_box[0] + element_box[2] // 2, element_box[1] + element_box[3] // 2)
+                        web_ele = driver_task.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
                     warn_obs = exec_action_type(info, web_ele, driver_task)
                     if 'wolfram' in task['web']:
                         time.sleep(5)
